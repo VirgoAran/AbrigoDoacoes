@@ -1,0 +1,6 @@
+{
+  "name": "Abrigo_Doacoes",
+  "description": "Sistema de Gestão de Doações para o Abrigo Doações com suporte a controle de bens físicos, doadores, movimentações e temas claro/escuro.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
