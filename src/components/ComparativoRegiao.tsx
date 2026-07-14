@@ -4,14 +4,14 @@
  */
 
 import React, { useState, useEffect } from 'react';
-import { supabase, isRealSupabaseConfigured, dbMock } from '../services/supabase';
+import { supabase, isRealSupabaseConfigured, dbMock, fetchAllRecords } from '../services/supabase';
 import { useThemeAuth } from '../context/ThemeAuthContext';
 import { Doacao, Doador } from '../types';
 import { 
   PieChart, Pie, Cell, ResponsiveContainer, Tooltip, Legend 
 } from 'recharts';
 import { 
-  Calendar, Search, Printer, MapPin, TrendingUp, RefreshCw, BarChart2, Award, ClipboardCheck 
+  Calendar, Search, Printer, MapPin, TrendingUp, RefreshCw, BarChart2, Award, ClipboardCheck
 } from 'lucide-react';
 
 interface RegiaoStats {
@@ -33,7 +33,7 @@ export const ComparativoRegiao: React.FC = () => {
   const { user, addLog } = useThemeAuth();
   const [doacoes, setDoacoes] = useState<Doacao[]>([]);
   const [doadores, setDoadores] = useState<Doador[]>([]);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
   
   const [dataInicio, setDataInicio] = useState('2026-07-01');
   const [dataFim, setDataFim] = useState('2026-07-31');
@@ -51,10 +51,22 @@ export const ComparativoRegiao: React.FC = () => {
       let rawDoadores: Doador[] = [];
 
       if (isRealSupabaseConfigured && supabase) {
-        const { data: donates } = await supabase.from('doacoes').select('*');
-        const { data: donors } = await supabase.from('doadores').select('*');
-        rawDoacoes = donates || [];
-        rawDoadores = donors || [];
+        try {
+          rawDoacoes = await fetchAllRecords<any>('doacoes', { order: { column: 'codigo_doacao', ascending: true } });
+        } catch (e: any) {
+          console.error(`ERRO doacoes:`, e);
+        }
+
+        const tabelasDoador = ['doadores', 'doador'];
+        for (const tbl of tabelasDoador) {
+          if (rawDoadores.length > 0) break;
+          try {
+            const records = await fetchAllRecords<any>(tbl, { order: { column: 'codigo_doador', ascending: true } });
+            rawDoadores = records as any;
+          } catch (e: any) {
+            console.error(`Erro ao buscar ${tbl}:`, e);
+          }
+        }
       } else {
         rawDoacoes = dbMock.get<Doacao>('DOACOES');
         rawDoadores = dbMock.get<Doador>('DOADORES');
@@ -62,10 +74,9 @@ export const ComparativoRegiao: React.FC = () => {
 
       setDoacoes(rawDoacoes);
       setDoadores(rawDoadores);
-      calculateStats(rawDoacoes, rawDoadores, dataInicio, dataFim);
-      
       setDisplayInicio(dataInicio);
       setDisplayFim(dataFim);
+      calculateStats(rawDoacoes, rawDoadores, dataInicio, dataFim);
 
     } catch (e: any) {
       console.error('Erro ao ler doações por região:', e);
@@ -100,9 +111,16 @@ export const ComparativoRegiao: React.FC = () => {
     });
 
     const regionCounts: { [key: string]: number } = {};
-    
+
     filtered.forEach(d => {
-      const donor = allDoadores.find(dn => dn.codigo_doador === d.codigo_doador);
+      const dAny = d as any;
+      const donorId = d.codigo_doador ?? dAny.doador_id ?? dAny.id_doador ?? dAny.codigo_doador_id;
+
+      const donor = allDoadores.find(dn => {
+        const dnAny = dn as any;
+        const dnId = dn.codigo_doador ?? dnAny.id ?? dnAny.doador_id ?? dnAny.codigo ?? dnAny.numero ?? dnAny.codigo_doador_id;
+        return String(dnId) === String(donorId);
+      });
       const region = donor?.regiao?.trim() || 'Não Especificada';
       regionCounts[region] = (regionCounts[region] || 0) + 1;
     });
@@ -247,7 +265,12 @@ export const ComparativoRegiao: React.FC = () => {
               </span>
             </header>
 
-            {regiaoStats.length === 0 ? (
+            {loading ? (
+              <div className="p-8 text-center text-slate-400 text-sm flex flex-col items-center gap-3">
+                <RefreshCw size={20} className="animate-spin text-blue-400" />
+                <span>Carregando dados...</span>
+              </div>
+            ) : regiaoStats.length === 0 ? (
               <div className="p-8 text-center text-slate-400 text-sm">
                 Nenhuma doação registrada com datas de retirada/remarcação neste período.
               </div>
@@ -304,7 +327,12 @@ export const ComparativoRegiao: React.FC = () => {
         <div className="col-span-12 lg:col-span-8">
           <div className="aero-black-panel p-6 md:p-10 rounded-2xl border border-white/10 flex flex-col items-center justify-center min-h-[500px] shadow-2xl print:border-none print:shadow-none">
             
-            {regiaoStats.length === 0 ? (
+            {loading ? (
+              <div className="flex flex-col items-center justify-center text-center p-12 space-y-4">
+                <RefreshCw size={28} className="animate-spin text-blue-400" />
+                <p className="font-bold text-slate-300">Carregando dados...</p>
+              </div>
+            ) : regiaoStats.length === 0 ? (
               <div className="flex flex-col items-center justify-center text-center p-12 space-y-4">
                 <div className="w-16 h-16 rounded-full bg-white/5 border border-white/10 flex items-center justify-center">
                   <MapPin size={28} className="text-slate-500" />
@@ -392,6 +420,7 @@ export const ComparativoRegiao: React.FC = () => {
         </div>
 
       </div>
+
     </div>
   );
 };
