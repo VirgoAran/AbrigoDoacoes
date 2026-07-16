@@ -235,6 +235,56 @@ const seedLocalStorage = () => {
 seedLocalStorage();
 
 const PAGE_SIZE = 1000;
+const PAGE_FETCH_CONCURRENCY = 6;
+const PAGE_NAV_SIZE = 200;
+
+const _dataCache = new Map<string, { data: any[]; ts: number }>();
+const _inFlightFetches = new Map<string, Promise<any[]>>();
+const CACHE_TTL = 5 * 60000;
+
+function cacheKey(table: string, options?: { select?: string; order?: { column: string; ascending?: boolean } }): string {
+  return `${table}|${options?.select || '*'}|${options?.order?.column || ''}|${options?.order?.ascending ?? true}`;
+}
+
+export function invalidateCache(table?: string) {
+  if (table) {
+    for (const key of _dataCache.keys()) {
+      if (key.startsWith(table + '|')) _dataCache.delete(key);
+    }
+  } else {
+    _dataCache.clear();
+  }
+}
+
+export async function fetchAllRecordsCached<T = any>(
+  table: string,
+  options?: {
+    select?: string;
+    order?: { column: string; ascending?: boolean };
+  }
+): Promise<T[]> {
+  if (!supabase) return [];
+  const key = cacheKey(table, options);
+  const cached = _dataCache.get(key);
+  if (cached && Date.now() - cached.ts < CACHE_TTL) {
+    return cached.data as T[];
+  }
+
+  const inFlight = _inFlightFetches.get(key);
+  if (inFlight) return inFlight as Promise<T[]>;
+
+  const request = fetchAllRecords<T>(table, options)
+    .then(data => {
+      _dataCache.set(key, { data, ts: Date.now() });
+      return data;
+    })
+    .finally(() => {
+      _inFlightFetches.delete(key);
+    });
+
+  _inFlightFetches.set(key, request as Promise<any[]>);
+  return request;
+}
 
 export async function fetchAllRecords<T = any>(
   table: string,
@@ -245,31 +295,112 @@ export async function fetchAllRecords<T = any>(
 ): Promise<T[]> {
   if (!supabase) return [];
 
-  const allData: T[] = [];
-  let from = 0;
-
-  while (true) {
-    const to = from + PAGE_SIZE - 1;
+  const buildQuery = () => {
     let query = supabase
       .from(table)
       .select(options?.select || '*');
 
-    if (options?.order) {
-      query = query.order(options.order.column, { ascending: options.order.ascending ?? true });
+    return options?.order
+      ? query.order(options.order.column, { ascending: options.order.ascending ?? true })
+      : query;
+  };
+
+  const { count, error: countError } = await supabase
+    .from(table)
+    .select(options?.select || '*', { count: 'exact', head: true });
+
+  if (countError || count === null) {
+    const allData: T[] = [];
+    let from = 0;
+
+    while (true) {
+      const { data, error } = await buildQuery().range(from, from + PAGE_SIZE - 1);
+
+      if (error) throw error;
+      if (!data || data.length === 0) break;
+
+      allData.push(...(data as T[]));
+      if (data.length < PAGE_SIZE) break;
+
+      from += PAGE_SIZE;
     }
 
-    const { data, error } = await query.range(from, to);
+    return allData;
+  }
 
-    if (error) throw error;
-    if (!data || data.length === 0) break;
+  if (count === 0) return [];
 
-    allData.push(...(data as T[]));
-    if (data.length < PAGE_SIZE) break;
+  const ranges = Array.from({ length: Math.ceil(count / PAGE_SIZE) }, (_, index) => {
+    const from = index * PAGE_SIZE;
+    return { from, to: Math.min(from + PAGE_SIZE - 1, count - 1) };
+  });
 
-    from += PAGE_SIZE;
+  const allData: T[] = [];
+  for (let index = 0; index < ranges.length; index += PAGE_FETCH_CONCURRENCY) {
+    const batch = ranges.slice(index, index + PAGE_FETCH_CONCURRENCY);
+    const pages = await Promise.all(
+      batch.map(async ({ from, to }) => {
+        const { data, error } = await buildQuery().range(from, to);
+        if (error) throw error;
+        return (data || []) as T[];
+      })
+    );
+
+    pages.forEach(page => allData.push(...page));
   }
 
   return allData;
+}
+
+export async function getTableCount(table: string): Promise<number> {
+  if (!supabase) return 0;
+  const { count, error } = await supabase
+    .from(table)
+    .select('*', { count: 'exact', head: true });
+  if (error) throw error;
+  return count || 0;
+}
+
+export async function fetchRecordsPage<T = any>(
+  table: string,
+  page: number,
+  pageSize: number = PAGE_NAV_SIZE,
+  options?: {
+    select?: string;
+    order?: { column: string; ascending?: boolean };
+  }
+): Promise<T[]> {
+  if (!supabase) return [];
+  const from = (page - 1) * pageSize;
+  const to = from + pageSize - 1;
+
+  let query = supabase
+    .from(table)
+    .select(options?.select || '*');
+
+  if (options?.order) {
+    query = query.order(options.order.column, { ascending: options.order.ascending ?? true });
+  }
+
+  const { data, error } = await query.range(from, to);
+  if (error) throw error;
+  return (data || []) as T[];
+}
+
+export async function fetchRecordById<T = any>(
+  table: string,
+  idColumn: string,
+  idValue: number | string,
+  select?: string
+): Promise<T | null> {
+  if (!supabase) return null;
+  const { data, error } = await supabase
+    .from(table)
+    .select(select || '*')
+    .eq(idColumn, idValue)
+    .single();
+  if (error) return null;
+  return data as T;
 }
 
 // Helper to interact with LocalStorage as a database client
