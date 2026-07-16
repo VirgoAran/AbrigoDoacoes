@@ -3,8 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect } from 'react';
-import { supabase, isRealSupabaseConfigured, dbMock, fetchAllRecords } from '../services/supabase';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { supabase, isRealSupabaseConfigured, dbMock, invalidateCache, getTableCount, fetchRecordsPage } from '../services/supabase';
 import { useThemeAuth } from '../context/ThemeAuthContext';
 import { Doador } from '../types';
 import { fetchAddressByCep } from '../utils/cep';
@@ -20,12 +20,16 @@ interface DoadoresProps {
 
 export const Doadores: React.FC<DoadoresProps> = ({ onOpenDoacoes }) => {
   const { addLog } = useThemeAuth();
+  const PAGE_SIZE = 200;
+
   const [doadores, setDoadores] = useState<Doador[]>([]);
   const [isLoading, setIsLoading] = useState(false);
-  const [searchFields, setSearchFields] = useState({ codigo: '', nome: '', cep: '', telefone: '' });
-  const [currentPage, setCurrentPage] = useState(1);
   const [totalCount, setTotalCount] = useState(0);
-  const pageSize = 2000;
+  const [currentPage, setCurrentPage] = useState(1);
+  const [searchFields, setSearchFields] = useState({ codigo: '', nome: '', cep: '', telefone: '' });
+  const [isSearchActive, setIsSearchActive] = useState(false);
+  const [donorSearch, setDonorSearch] = useState('');
+  const [showDonorResults, setShowDonorResults] = useState(false);
   
   // Form State
   const [selectedDoador, setSelectedDoador] = useState<Doador | null>(null);
@@ -55,29 +59,91 @@ export const Doadores: React.FC<DoadoresProps> = ({ onOpenDoacoes }) => {
 
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const [isCepLoading, setIsCepLoading] = useState(false);
+  const donorContainerRef = useRef<HTMLDivElement>(null);
+  const [searchResults, setSearchResults] = useState<Doador[]>([]);
+  const [searchingDonor, setSearchingDonor] = useState(false);
+  const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const loadDoadores = async () => {
+  const searchDonorsServer = async (q: string) => {
+    if (!supabase || q.length < 2) {
+      setSearchResults([]);
+      return;
+    }
+    setSearchingDonor(true);
+    try {
+      const num = Number(q.replace(/\D/g, ''));
+      let query = supabase
+        .from('doadores')
+        .select('codigo_doador, nome, cidade, estado')
+        .limit(50);
+      if (!isNaN(num) && num > 0 && String(num).length >= 2) {
+        query = query.eq('codigo_doador', num);
+      } else {
+        query = query.ilike('nome', `%${q}%`);
+      }
+      const { data } = await query;
+      setSearchResults((data || []) as Doador[]);
+    } catch {
+      setSearchResults([]);
+    }
+    setSearchingDonor(false);
+  };
+
+  const handleDonorSearchInput = (val: string) => {
+    setDonorSearch(val);
+    setShowDonorResults(true);
+    if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
+    if (val.length < 2) {
+      setSearchResults([]);
+      return;
+    }
+    searchTimerRef.current = setTimeout(() => searchDonorsServer(val), 300);
+  };
+
+  const loadDoadores = async (filters?: { codigo?: string; nome?: string; cep?: string; telefone?: string }, page?: number, selectIndex?: number) => {
     setIsLoading(true);
+    const targetPage = page || 1;
     let loadedList: Doador[] = [];
+    let loadedTotal = 0;
+
     if (isRealSupabaseConfigured && supabase) {
       try {
-        const { count } = await supabase
-          .from('doadores')
-          .select('*', { count: 'exact', head: true });
-        const total = count || 0;
-        setTotalCount(total);
+        const hasFilters = filters && (filters.codigo || filters.nome || filters.cep || filters.telefone);
+        if (hasFilters) {
+          let query = supabase.from('doadores').select('*');
 
-        const from = (currentPage - 1) * pageSize;
-        const to = Math.min(from + pageSize - 1, total - 1);
-        if (from <= to) {
-          const { data } = await supabase
-            .from('doadores')
-            .select('*')
-            .order('codigo_doador', { ascending: true })
-            .range(from, to);
+          if (filters!.codigo) {
+            query = query.eq('codigo_doador', Number(filters!.codigo));
+          }
+          if (filters!.nome) {
+            query = query.ilike('nome', `%${filters!.nome}%`);
+          }
+          if (filters!.cep) {
+            query = query.ilike('cep', `%${filters!.cep}%`);
+          }
+          if (filters!.telefone) {
+            query = query.or(`celular.ilike.%${filters!.telefone}%,fixo.ilike.%${filters!.telefone}%`);
+          }
+
+          query = query.order('codigo_doador', { ascending: true });
+
+          const { data } = await query;
           loadedList = data || [];
+          loadedTotal = loadedList.length;
+          setDoadores(loadedList);
+          setTotalCount(loadedTotal);
+          setCurrentPage(1);
+        } else {
+          const [countResult, pageResult] = await Promise.all([
+            getTableCount('doadores'),
+            fetchRecordsPage<Doador>('doadores', targetPage, PAGE_SIZE, { order: { column: 'codigo_doador', ascending: true } })
+          ]);
+          loadedList = pageResult;
+          loadedTotal = countResult;
+          setDoadores(pageResult);
+          setTotalCount(countResult);
+          setCurrentPage(targetPage);
         }
-        setDoadores(loadedList);
       } catch (e: any) {
         console.error(e);
         showFeedback('error', 'Erro ao carregar doadores: ' + e.message);
@@ -86,8 +152,10 @@ export const Doadores: React.FC<DoadoresProps> = ({ onOpenDoacoes }) => {
       const list = dbMock.get<Doador>('DOADORES');
       list.sort((a, b) => a.codigo_doador - b.codigo_doador);
       loadedList = list;
-      setTotalCount(list.length);
+      loadedTotal = list.length;
       setDoadores(list);
+      setTotalCount(list.length);
+      setCurrentPage(1);
     }
 
     if (isInitialLoad && loadedList.length > 0) {
@@ -117,6 +185,34 @@ export const Doadores: React.FC<DoadoresProps> = ({ onOpenDoacoes }) => {
         historico: firstDoador.historico || ''
       });
       setIsInitialLoad(false);
+    } else if (selectIndex !== undefined && loadedList.length > 0) {
+      const targetIdx = selectIndex === -1 ? loadedList.length - 1 : selectIndex;
+      if (!loadedList[targetIdx]) return;
+      const targetDoador = loadedList[targetIdx];
+      setSelectedDoador(targetDoador);
+      setFormState({
+        nome: targetDoador.nome || '',
+        data_cadastro: targetDoador.data_cadastro || new Date().toISOString().split('T')[0],
+        celular: targetDoador.celular || '',
+        fixo: targetDoador.fixo || '',
+        contato: targetDoador.contato || '',
+        email: targetDoador.email || '',
+        whatsapp: targetDoador.whatsapp || '',
+        cep: targetDoador.cep || '',
+        logradouro: targetDoador.logradouro || '',
+        endereco: targetDoador.endereco || '',
+        complemento: targetDoador.complemento || '',
+        bairro: targetDoador.bairro || '',
+        cidade: targetDoador.cidade || '',
+        estado: targetDoador.estado || '',
+        cod_tlmk: targetDoador.cod_tlmk || '',
+        cod_matcob: targetDoador.cod_matcob || '',
+        tipo_doador: targetDoador.tipo_doador || '',
+        dia_semana: targetDoador.dia_semana || '',
+        regiao: targetDoador.regiao || '',
+        mapa: targetDoador.mapa || '',
+        historico: targetDoador.historico || ''
+      });
     }
     setIsLoading(false);
   };
@@ -125,7 +221,21 @@ export const Doadores: React.FC<DoadoresProps> = ({ onOpenDoacoes }) => {
 
   useEffect(() => {
     loadDoadores();
-  }, [currentPage]);
+    return () => {
+      if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!showDonorResults) return;
+    const handler = (e: MouseEvent) => {
+      if (donorContainerRef.current && !donorContainerRef.current.contains(e.target as Node)) {
+        setShowDonorResults(false);
+      }
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [showDonorResults]);
 
   const showFeedback = (type: 'success' | 'error', text: string) => {
     setMessage({ type, text });
@@ -234,8 +344,11 @@ export const Doadores: React.FC<DoadoresProps> = ({ onOpenDoacoes }) => {
         await addLog('Cadastrou Doador', 'Doadores', `Doador: ${formState.nome}`);
         showFeedback('success', `Doador "${formState.nome}" cadastrado com sucesso!`);
       }
+      invalidateCache('doadores');
       handleReset();
-      setCurrentPage(1);
+      setSearchFields({ codigo: '', nome: '', cep: '', telefone: '' });
+      setIsSearchActive(false);
+      loadDoadores();
     } catch (e: any) {
       console.error(e);
       showFeedback('error', 'Ocorreu um erro ao salvar o doador: ' + e.message);
@@ -293,9 +406,12 @@ export const Doadores: React.FC<DoadoresProps> = ({ onOpenDoacoes }) => {
         const list = dbMock.get<Doador>('DOADORES');
         dbMock.save('DOADORES', list.filter(item => item.codigo_doador !== codigo));
       }
+      invalidateCache('doadores');
       await addLog('Excluiu Doador', 'Doadores', `Doador: ${nome} (Código: ${codigo})`);
       showFeedback('success', `Doador "${nome}" excluído com sucesso!`);
-      setCurrentPage(1);
+      setSearchFields({ codigo: '', nome: '', cep: '', telefone: '' });
+      setIsSearchActive(false);
+      loadDoadores();
       if (selectedDoador?.codigo_doador === codigo) {
         handleReset();
       }
@@ -306,8 +422,6 @@ export const Doadores: React.FC<DoadoresProps> = ({ onOpenDoacoes }) => {
     setIsLoading(false);
   };
 
-  const totalPages = Math.ceil(totalCount / pageSize) || 1;
-
   const getDisplayRegistry = () => {
     const totalStr = String(totalCount).padStart(6, '0');
     if (!selectedDoador) {
@@ -317,20 +431,27 @@ export const Doadores: React.FC<DoadoresProps> = ({ onOpenDoacoes }) => {
     if (idx === -1) {
       return `0 / ${totalStr}`;
     }
-    const globalIdx = (currentPage - 1) * pageSize + idx + 1;
-    return `${globalIdx} / ${totalStr}`;
+    const globalPos = (currentPage - 1) * PAGE_SIZE + idx + 1;
+    return `${globalPos} / ${totalStr}`;
   };
 
-  // Record Navigation handlers
+  // Record Navigation handlers (paginated)
   const handleGoFirst = () => {
-    if (doadores.length > 0) {
+    if (totalCount === 0) return;
+    if (currentPage === 1 && doadores.length > 0) {
       handleEditSelect(doadores[0], false);
+    } else {
+      loadDoadores(undefined, 1, 0);
     }
   };
 
   const handleGoLast = () => {
-    if (doadores.length > 0) {
+    if (totalCount === 0) return;
+    const lastPage = Math.ceil(totalCount / PAGE_SIZE);
+    if (currentPage === lastPage && doadores.length > 0) {
       handleEditSelect(doadores[doadores.length - 1], false);
+    } else {
+      loadDoadores(undefined, lastPage, -1);
     }
   };
 
@@ -343,6 +464,8 @@ export const Doadores: React.FC<DoadoresProps> = ({ onOpenDoacoes }) => {
     const idx = doadores.findIndex(d => d.codigo_doador === selectedDoador.codigo_doador);
     if (idx > 0) {
       handleEditSelect(doadores[idx - 1], false);
+    } else if (currentPage > 1) {
+      loadDoadores(undefined, currentPage - 1, -1);
     }
   };
 
@@ -355,6 +478,8 @@ export const Doadores: React.FC<DoadoresProps> = ({ onOpenDoacoes }) => {
     const idx = doadores.findIndex(d => d.codigo_doador === selectedDoador.codigo_doador);
     if (idx < doadores.length - 1) {
       handleEditSelect(doadores[idx + 1], false);
+    } else if (currentPage < Math.ceil(totalCount / PAGE_SIZE)) {
+      loadDoadores(undefined, currentPage + 1, 0);
     }
   };
 
@@ -368,17 +493,6 @@ export const Doadores: React.FC<DoadoresProps> = ({ onOpenDoacoes }) => {
     }
     showFeedback('success', 'Operação cancelada/restaurada.');
   };
-
-  const hasSearch = searchFields.codigo || searchFields.nome || searchFields.cep || searchFields.telefone;
-  const filteredDoadores = hasSearch ? doadores.filter(d => {
-    const matchCodigo = !searchFields.codigo || String(d.codigo_doador).includes(searchFields.codigo);
-    const matchNome = !searchFields.nome || d.nome.toLowerCase().includes(searchFields.nome.toLowerCase());
-    const matchCep = !searchFields.cep || (d.cep || '').includes(searchFields.cep);
-    const matchTel = !searchFields.telefone || 
-      (d.celular || '').includes(searchFields.telefone) || 
-      (d.fixo || '').includes(searchFields.telefone);
-    return matchCodigo && matchNome && matchCep && matchTel;
-  }) : doadores;
 
   return (
     <div className="space-y-8 animate-fade-in">
@@ -457,7 +571,10 @@ export const Doadores: React.FC<DoadoresProps> = ({ onOpenDoacoes }) => {
             <div className="flex items-center gap-2 pb-[2px]">
               <button
                 type="button"
-                onClick={() => setSearchFields(prev => ({ ...prev }))}
+                onClick={() => {
+                  setIsSearchActive(true);
+                  loadDoadores(searchFields);
+                }}
                 className="h-9 px-5 rounded-lg bg-blue-500/20 hover:bg-blue-500/30 border border-blue-500/30 text-blue-200 text-[10px] font-bold uppercase tracking-wider transition-all cursor-pointer flex items-center gap-1.5"
               >
                 <Search size={12} />
@@ -465,7 +582,11 @@ export const Doadores: React.FC<DoadoresProps> = ({ onOpenDoacoes }) => {
               </button>
               <button
                 type="button"
-                onClick={() => setSearchFields({ codigo: '', nome: '', cep: '', telefone: '' })}
+                onClick={() => {
+                  setSearchFields({ codigo: '', nome: '', cep: '', telefone: '' });
+                  setIsSearchActive(false);
+                  loadDoadores();
+                }}
                 className="h-9 px-5 rounded-lg bg-white/10 hover:bg-white/15 border border-white/10 text-white/70 text-[10px] font-bold uppercase tracking-wider transition-all cursor-pointer flex items-center gap-1.5"
               >
                 <X size={12} />
@@ -480,29 +601,58 @@ export const Doadores: React.FC<DoadoresProps> = ({ onOpenDoacoes }) => {
           <div className="p-5 rounded-2xl bg-white/5 border border-white/10 flex flex-col gap-5">
             {/* Top Row: Dropdown and Transition to Doações */}
             <div className="flex flex-col lg:flex-row items-stretch lg:items-center justify-between gap-4">
-              <div className="flex flex-col gap-1.5 flex-1">
-                <label className="text-[10px] font-bold uppercase tracking-wider text-blue-300">Carregar Doador Cadastrado (Seleção Direta)</label>
-                <select
-                  id="seletor-doador"
-                  value={selectedDoador ? selectedDoador.codigo_doador : ''}
-                  onChange={e => {
-                    const val = e.target.value;
-                    if (val === '') {
-                      handleReset();
-                    } else {
-                      const found = doadores.find(d => d.codigo_doador === Number(val));
-                      if (found) handleEditSelect(found, false);
-                    }
-                  }}
-                  className="aero-input-gloss w-full h-10 px-4 rounded-xl text-sm font-semibold cursor-pointer appearance-none text-white bg-slate-950/80"
-                >
-                  <option value="" className="bg-slate-900 text-white/50">-- Novo Cadastro de Doador --</option>
-                  {doadores.map(d => (
-                    <option key={d.codigo_doador} value={d.codigo_doador} className="bg-slate-900 text-white">
-                      #{String(d.codigo_doador).padStart(4, '0')} - {d.nome} {d.cidade ? `(${d.cidade}/${d.estado})` : ''}
-                    </option>
-                  ))}
-                </select>
+              <div className="flex flex-col gap-1.5 flex-1 relative" ref={donorContainerRef}>
+                <label className="text-[10px] font-bold uppercase tracking-wider text-blue-300">Carregar Doador Cadastrado (Busca Rápida)</label>
+                <div className="relative">
+                  <input
+                    type="text"
+                    placeholder={selectedDoador ? `#${String(selectedDoador.codigo_doador).padStart(4, '0')} - ${selectedDoador.nome}` : 'Digite nome ou código para buscar...'}
+                    value={donorSearch}
+                    onChange={e => handleDonorSearchInput(e.target.value)}
+                    onFocus={() => { if (searchResults.length > 0 || searchingDonor) setShowDonorResults(true); }}
+                    className="aero-input-gloss w-full h-10 px-4 rounded-xl text-sm font-semibold text-white bg-slate-950/80"
+                  />
+                  {showDonorResults && donorSearch.length >= 2 && (
+                    <div className="absolute top-full left-0 right-0 mt-1 max-h-60 overflow-y-auto rounded-xl bg-slate-900 border border-white/10 shadow-2xl z-50">
+                      {searchingDonor ? (
+                        <div className="px-4 py-3 text-xs text-slate-400 flex items-center gap-2">
+                          <RefreshCw size={12} className="animate-spin" />
+                          Buscando...
+                        </div>
+                      ) : searchResults.length === 0 ? (
+                        <div className="px-4 py-3 text-xs text-slate-400">Nenhum doador encontrado</div>
+                      ) : (
+                        searchResults.map(d => (
+                          <button
+                            key={d.codigo_doador}
+                            type="button"
+                            className="w-full text-left px-4 py-2.5 text-xs text-white hover:bg-blue-500/20 border-b border-white/5 last:border-b-0 flex items-center gap-3"
+                            onClick={async () => {
+                              setShowDonorResults(false);
+                              setDonorSearch('');
+                              if (supabase) {
+                                const { data } = await supabase.from('doadores').select('*').eq('codigo_doador', d.codigo_doador).single();
+                                if (data) handleEditSelect(data as Doador, false);
+                              } else {
+                                handleEditSelect(d, false);
+                              }
+                            }}
+                          >
+                            <span className="font-mono text-blue-300 font-bold shrink-0">
+                              #{String(d.codigo_doador).padStart(4, '0')}
+                            </span>
+                            <span className="font-semibold truncate">{d.nome}</span>
+                            {d.cidade && (
+                              <span className="text-slate-500 shrink-0 ml-auto">
+                                ({d.cidade}/{d.estado})
+                              </span>
+                            )}
+                          </button>
+                        ))
+                      )}
+                    </div>
+                  )}
+                </div>
               </div>
 
               {/* Transition Button to Cadastro de Doações */}
@@ -539,7 +689,7 @@ export const Doadores: React.FC<DoadoresProps> = ({ onOpenDoacoes }) => {
                   id="btn-nav-primeiro"
                   type="button"
                   onClick={handleGoFirst}
-                  disabled={doadores.length === 0 || (selectedDoador && doadores[0]?.codigo_doador === selectedDoador.codigo_doador)}
+                  disabled={totalCount === 0 || (currentPage === 1 && selectedDoador && doadores[0]?.codigo_doador === selectedDoador.codigo_doador)}
                   className="w-9 h-9 rounded-lg flex items-center justify-center bg-white/5 hover:bg-white/10 disabled:opacity-30 disabled:hover:bg-transparent transition-all border border-white/10 text-white cursor-pointer"
                   title="Primeiro Registro"
                 >
@@ -549,7 +699,7 @@ export const Doadores: React.FC<DoadoresProps> = ({ onOpenDoacoes }) => {
                   id="btn-nav-anterior"
                   type="button"
                   onClick={handleGoPrev}
-                  disabled={doadores.length === 0 || (selectedDoador && doadores[0]?.codigo_doador === selectedDoador.codigo_doador)}
+                  disabled={totalCount === 0 || (currentPage === 1 && selectedDoador && doadores[0]?.codigo_doador === selectedDoador.codigo_doador)}
                   className="w-9 h-9 rounded-lg flex items-center justify-center bg-white/5 hover:bg-white/10 disabled:opacity-30 disabled:hover:bg-transparent transition-all border border-white/10 text-white cursor-pointer"
                   title="Registro Anterior"
                 >
@@ -565,7 +715,7 @@ export const Doadores: React.FC<DoadoresProps> = ({ onOpenDoacoes }) => {
                   id="btn-nav-proximo"
                   type="button"
                   onClick={handleGoNext}
-                  disabled={doadores.length === 0 || !selectedDoador || (selectedDoador && doadores[doadores.length - 1]?.codigo_doador === selectedDoador.codigo_doador)}
+                  disabled={totalCount === 0 || !selectedDoador || (currentPage >= Math.ceil(totalCount / PAGE_SIZE) && selectedDoador && doadores[doadores.length - 1]?.codigo_doador === selectedDoador.codigo_doador)}
                   className="w-9 h-9 rounded-lg flex items-center justify-center bg-white/5 hover:bg-white/10 disabled:opacity-30 disabled:hover:bg-transparent transition-all border border-white/10 text-white cursor-pointer"
                   title="Próximo Registro"
                 >
@@ -575,40 +725,13 @@ export const Doadores: React.FC<DoadoresProps> = ({ onOpenDoacoes }) => {
                   id="btn-nav-ultimo"
                   type="button"
                   onClick={handleGoLast}
-                  disabled={doadores.length === 0 || !selectedDoador || (selectedDoador && doadores[doadores.length - 1]?.codigo_doador === selectedDoador.codigo_doador)}
+                  disabled={totalCount === 0 || !selectedDoador || (currentPage >= Math.ceil(totalCount / PAGE_SIZE) && selectedDoador && doadores[doadores.length - 1]?.codigo_doador === selectedDoador.codigo_doador)}
                   className="w-9 h-9 rounded-lg flex items-center justify-center bg-white/5 hover:bg-white/10 disabled:opacity-30 disabled:hover:bg-transparent transition-all border border-white/10 text-white cursor-pointer"
                   title="Último Registro"
                 >
                   <ChevronsRight size={16} />
                 </button>
               </div>
-
-              {/* Page Navigation controls */}
-              {isRealSupabaseConfigured && supabase && (
-                <div className="flex items-center gap-2 bg-black/30 p-1.5 rounded-xl border border-white/5">
-                  <button
-                    type="button"
-                    onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
-                    disabled={currentPage <= 1}
-                    className="w-9 h-9 rounded-lg flex items-center justify-center bg-white/5 hover:bg-white/10 disabled:opacity-30 disabled:hover:bg-transparent transition-all border border-white/10 text-white cursor-pointer"
-                    title="Página Anterior"
-                  >
-                    <ChevronLeft size={16} />
-                  </button>
-                  <span className="font-mono text-xs font-extrabold px-3 py-1.5 bg-black/50 text-emerald-300 border border-white/10 rounded-lg min-w-[110px] text-center tracking-wider">
-                    Pág {currentPage} / {totalPages}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
-                    disabled={currentPage >= totalPages}
-                    className="w-9 h-9 rounded-lg flex items-center justify-center bg-white/5 hover:bg-white/10 disabled:opacity-30 disabled:hover:bg-transparent transition-all border border-white/10 text-white cursor-pointer"
-                    title="Próxima Página"
-                  >
-                    <ChevronRight size={16} />
-                  </button>
-                </div>
-              )}
 
               {/* Action buttons: + Novo, Salvar, Cancelar, Excluir */}
               <div className="flex flex-wrap items-center gap-2">

@@ -4,13 +4,13 @@
  */
 
 import React, { useState, useEffect } from 'react';
-import { supabase, isRealSupabaseConfigured, dbMock, fetchAllRecords } from '../services/supabase';
+import { supabase, isRealSupabaseConfigured, dbMock, fetchAllRecordsCached, invalidateCache, getTableCount, fetchRecordsPage } from '../services/supabase';
 import { useThemeAuth } from '../context/ThemeAuthContext';
 import { Doacao, ItemDoacao, Doador, Categoria, ItemCatalogo } from '../types';
 import { 
   Gift, User, Calendar, FileText, PlusCircle, Trash2, 
   Search, Save, RefreshCw, Sparkles, X, CheckCircle2, Ban,
-  ChevronLeft, ChevronRight
+  ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight
 } from 'lucide-react';
 
 interface DoacoesProps {
@@ -20,15 +20,17 @@ interface DoacoesProps {
 
 export const Doacoes: React.FC<DoacoesProps> = ({ prefilledDoadorId, clearPrefilledDoadorId }) => {
   const { addLog } = useThemeAuth();
+  const DOACOES_PAGE_SIZE = 200;
+
   const [doacoes, setDoacoes] = useState<Doacao[]>([]);
   const [doadores, setDoadores] = useState<Doador[]>([]);
   const [categorias, setCategorias] = useState<Categoria[]>([]);
   const [itensCatalogo, setItensCatalogo] = useState<ItemCatalogo[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
-  const [currentPage, setCurrentPage] = useState(1);
-  const [totalCount, setTotalCount] = useState(0);
-  const pageSize = 1000;
+  const [totalDoacoes, setTotalDoacoes] = useState(0);
+  const [currentDoacoesPage, setCurrentDoacoesPage] = useState(1);
+  const [isSearchActive, setIsSearchActive] = useState(false);
 
   // Dropdown selectors / searchers
 
@@ -67,43 +69,90 @@ export const Doacoes: React.FC<DoacoesProps> = ({ prefilledDoadorId, clearPrefil
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const [nextDonationCode, setNextDonationCode] = useState<number | null>(null);
 
-  const computeNextCode = (list: Doacao[]) => {
-    const maxCode = list.reduce((max, d) => Math.max(max, d.codigo_doacao), 0);
-    setNextDonationCode(maxCode + 1);
+  const computeNextCode = async () => {
+    setNextDonationCode(null);
+    if (isRealSupabaseConfigured && supabase) {
+      try {
+        const { data } = await supabase
+          .from('doacoes')
+          .select('codigo_doacao')
+          .order('codigo_doacao', { ascending: false })
+          .limit(1);
+        const maxCode = data && data[0] ? data[0].codigo_doacao : 0;
+        setNextDonationCode(maxCode + 1);
+      } catch {
+        setNextDonationCode(1);
+      }
+    } else {
+      const list = dbMock.get<Doacao>('DOACOES');
+      const maxCode = list.reduce((max, d) => Math.max(max, d.codigo_doacao), 0);
+      setNextDonationCode(maxCode + 1);
+    }
+  };
+
+  const loadDoacoesPage = async (page: number, search?: string) => {
+    if (isRealSupabaseConfigured && supabase) {
+      try {
+        if (search) {
+          const num = Number(search.replace(/\D/g, ''));
+          let query = supabase.from('doacoes').select('*').order('codigo_doacao', { ascending: false });
+          if (!isNaN(num) && num > 0) {
+            query = query.eq('codigo_doacao', num);
+          } else {
+            query = query.or(`responsavel.ilike.%${search}%,observacoes.ilike.%${search}%`);
+          }
+          const { data } = await query;
+          setDoacoes((data || []) as Doacao[]);
+          setTotalDoacoes(data?.length || 0);
+          setCurrentDoacoesPage(1);
+        } else {
+          const [countResult, pageResult] = await Promise.all([
+            getTableCount('doacoes'),
+            fetchRecordsPage<Doacao>('doacoes', page, DOACOES_PAGE_SIZE, { order: { column: 'codigo_doacao', ascending: false } })
+          ]);
+          setDoacoes(pageResult || []);
+          setTotalDoacoes(countResult);
+          setCurrentDoacoesPage(page);
+        }
+      } catch (e: any) {
+        console.error(e);
+        showFeedback('error', 'Erro ao carregar doações: ' + e.message);
+      }
+    } else {
+      const list = dbMock.get<Doacao>('DOACOES');
+      list.sort((a, b) => b.codigo_doacao - a.codigo_doacao);
+      if (search) {
+        const filtered = list.filter(d =>
+          String(d.codigo_doacao).includes(search) ||
+          (d.responsavel && d.responsavel.toLowerCase().includes(search.toLowerCase()))
+        );
+        setDoacoes(filtered);
+        setTotalDoacoes(filtered.length);
+      } else {
+        const start = (page - 1) * DOACOES_PAGE_SIZE;
+        const paged = list.slice(start, start + DOACOES_PAGE_SIZE);
+        setDoacoes(paged);
+        setTotalDoacoes(list.length);
+      }
+      setCurrentDoacoesPage(page);
+    }
   };
 
   const loadEssentialData = async () => {
     setIsLoading(true);
     if (isRealSupabaseConfigured && supabase) {
       try {
-        const donors = await fetchAllRecords<any>('doadores', { order: { column: 'nome' } });
-        const { data: cats } = await supabase.from('categoria').select('*').eq('status', 'Ativo');
-        const catItems = await fetchAllRecords<any>('itens');
+        const [donors, catsResult, catItems] = await Promise.all([
+          fetchAllRecordsCached<any>('doadores', { select: 'codigo_doador, nome', order: { column: 'nome' } }),
+          supabase.from('categoria').select('*').eq('status', 'Ativo'),
+          fetchAllRecordsCached<any>('itens'),
+        ]);
 
-        const { data: allDoacoes, count } = await supabase
-          .from('doacoes')
-          .select('codigo_doacao', { count: 'exact', head: false })
-          .order('codigo_doacao', { ascending: false });
-        const total = count || 0;
-        setTotalCount(total);
-        computeNextCode(allDoacoes || []);
-
-        const from = (currentPage - 1) * pageSize;
-        const to = Math.min(from + pageSize - 1, total - 1);
-        let donates: Doacao[] = [];
-        if (from <= to) {
-          const { data } = await supabase
-            .from('doacoes')
-            .select('*')
-            .order('codigo_doacao', { ascending: false })
-            .range(from, to);
-          donates = data || [];
-        }
+        if (catsResult.error) throw catsResult.error;
 
         setDoadores(donors || []);
-        setCategorias(cats || []);
+        setCategorias(catsResult.data || []);
         setItensCatalogo(catItems || []);
-        setDoacoes(donates || []);
       } catch (e: any) {
         console.error(e);
         showFeedback('error', 'Erro ao carregar dados do Supabase: ' + e.message);
@@ -112,19 +161,17 @@ export const Doacoes: React.FC<DoacoesProps> = ({ prefilledDoadorId, clearPrefil
       setDoadores(dbMock.get<Doador>('DOADORES'));
       setCategorias(dbMock.get<Categoria>('CATEGORIA').filter(c => c.status === 'Ativo'));
       setItensCatalogo(dbMock.get<ItemCatalogo>('ITENS'));
-      
-      const list = dbMock.get<Doacao>('DOACOES');
-      list.sort((a, b) => b.codigo_doacao - a.codigo_doacao);
-      setTotalCount(list.length);
-      setDoacoes(list);
-      computeNextCode(list);
     }
+    await Promise.all([
+      loadDoacoesPage(1),
+      computeNextCode()
+    ]);
     setIsLoading(false);
   };
 
   useEffect(() => {
     loadEssentialData();
-  }, [currentPage]);
+  }, []);
 
   useEffect(() => {
     if (prefilledDoadorId !== undefined && prefilledDoadorId !== null) {
@@ -369,8 +416,15 @@ export const Doacoes: React.FC<DoacoesProps> = ({ prefilledDoadorId, clearPrefil
         await addLog('Registrou Doação', 'Doações', `Doação #${newCodigo} registrada com sucesso.`);
         showFeedback('success', `Nova Doação registrada com Código #${newCodigo}!`);
       }
+      invalidateCache('doacoes');
+      invalidateCache('itens_doacao');
       handleReset();
-      setCurrentPage(1);
+      await Promise.all([
+        loadDoacoesPage(isSearchActive ? 1 : currentDoacoesPage),
+        computeNextCode()
+      ]);
+      setIsLoading(false);
+      return;
     } catch (e: any) {
       console.error(e);
       showFeedback('error', 'Erro ao salvar doação: ' + e.message);
@@ -414,10 +468,15 @@ export const Doacoes: React.FC<DoacoesProps> = ({ prefilledDoadorId, clearPrefil
         const items = dbMock.get<ItemDoacao>('ITENS_DOACAO');
         dbMock.save('ITENS_DOACAO', items.filter(item => String(item.id_doacao) !== String(codigo)));
       }
+      invalidateCache('doacoes');
+      invalidateCache('itens_doacao');
       await addLog('Excluiu Doação', 'Doações', `Doação #${codigo} removida.`);
       showFeedback('success', `Doação #${codigo} excluída com sucesso!`);
       handleReset();
-      setCurrentPage(1);
+      await Promise.all([
+        loadDoacoesPage(isSearchActive ? 1 : currentDoacoesPage),
+        computeNextCode()
+      ]);
     } catch (e: any) {
       console.error(e);
       showFeedback('error', 'Erro ao deletar doação: ' + e.message);
@@ -425,15 +484,25 @@ export const Doacoes: React.FC<DoacoesProps> = ({ prefilledDoadorId, clearPrefil
     setIsLoading(false);
   };
 
-  // Filter donations list
-  const filteredDoacoesList = doacoes.filter(doc => {
-    const donorObj = doadores.find(d => d.codigo_doador === doc.codigo_doador);
-    const donorName = donorObj ? donorObj.nome.toLowerCase() : '';
-    const matchSearch = String(doc.codigo_doacao).includes(searchTerm) || 
-                        donorName.includes(searchTerm.toLowerCase()) ||
-                        (doc.responsavel && doc.responsavel.toLowerCase().includes(searchTerm.toLowerCase()));
-    return matchSearch;
-  });
+  // Filter donations list (server-side search or current page)
+  const filteredDoacoesList = doacoes;
+
+  const handleSearchDoacao = (val: string) => {
+    setSearchTerm(val);
+    if (val.length >= 2) {
+      setIsSearchActive(true);
+      loadDoacoesPage(1, val);
+    } else if (val.length === 0 && isSearchActive) {
+      setIsSearchActive(false);
+      loadDoacoesPage(1);
+    }
+  };
+
+  const handleClearSearch = () => {
+    setSearchTerm('');
+    setIsSearchActive(false);
+    loadDoacoesPage(1);
+  };
 
   // Filter Catalog Items based on the selected Category
   const availableCatalogItems = itensCatalogo.filter(i => i.codigo_base === categorias.find(c => c.nome === tempItem.categoria)?.codigo_base);
@@ -763,34 +832,15 @@ export const Doacoes: React.FC<DoacoesProps> = ({ prefilledDoadorId, clearPrefil
             <h2 className="text-white font-bold text-sm tracking-wide uppercase text-glow">Doações Cadastradas</h2>
           </div>
           <div className="flex items-center gap-2 self-start sm:self-auto">
-            {isRealSupabaseConfigured && supabase && (
-              <div className="flex items-center gap-1 bg-black/30 p-1 rounded-lg border border-white/5">
-                <button
-                  type="button"
-                  onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
-                  disabled={currentPage <= 1}
-                  className="w-7 h-7 rounded-md flex items-center justify-center bg-white/5 hover:bg-white/10 disabled:opacity-30 disabled:hover:bg-transparent transition-all border border-white/10 text-white cursor-pointer"
-                  title="Página Anterior"
-                >
-                  <ChevronLeft size={12} />
-                </button>
-                <span className="font-mono text-[10px] font-extrabold px-2 bg-black/50 text-emerald-300 border border-white/10 rounded-md text-center min-w-[70px]">
-                  {currentPage} / {Math.ceil(totalCount / pageSize) || 1}
-                </span>
-                <button
-                  type="button"
-                  onClick={() => setCurrentPage(p => Math.min(Math.ceil(totalCount / pageSize) || 1, p + 1))}
-                  disabled={currentPage >= Math.ceil(totalCount / pageSize) || 1}
-                  className="w-7 h-7 rounded-md flex items-center justify-center bg-white/5 hover:bg-white/10 disabled:opacity-30 disabled:hover:bg-transparent transition-all border border-white/10 text-white cursor-pointer"
-                  title="Próxima Página"
-                >
-                  <ChevronRight size={12} />
-                </button>
-              </div>
+            {isSearchActive ? (
+              <span className="bg-amber-500/20 text-amber-300 text-[10px] px-3 py-1 rounded-full uppercase tracking-widest border border-amber-500/20 font-bold">
+                {totalDoacoes} resultado(s)
+              </span>
+            ) : (
+              <span className="bg-white/10 text-white text-[10px] px-3 py-1 rounded-full uppercase tracking-widest border border-white/10 font-bold">
+                {totalDoacoes} registro(s) no banco
+              </span>
             )}
-            <span className="bg-white/10 text-white text-[10px] px-3 py-1 rounded-full uppercase tracking-widest border border-white/10 font-bold">
-              {totalCount || filteredDoacoesList.length} registro(s) no banco
-            </span>
           </div>
         </header>
 
@@ -802,11 +852,20 @@ export const Doacoes: React.FC<DoacoesProps> = ({ prefilledDoadorId, clearPrefil
             </span>
             <input
               type="text"
-              placeholder="Buscar por código, responsável ou doador..."
+              placeholder="Buscar por código, responsável..."
               value={searchTerm}
-              onChange={e => setSearchTerm(e.target.value)}
+              onChange={e => handleSearchDoacao(e.target.value)}
               className="aero-input-gloss w-full h-10 pl-10 pr-4 rounded-xl text-sm text-white placeholder-white/30"
             />
+            {isSearchActive && (
+              <button
+                type="button"
+                onClick={handleClearSearch}
+                className="absolute right-2 top-1/2 -translate-y-1/2 w-6 h-6 rounded flex items-center justify-center bg-white/10 hover:bg-white/20 text-white/60 hover:text-white transition-all cursor-pointer"
+              >
+                <X size={14} />
+              </button>
+            )}
           </div>
 
           <div className="rounded-xl overflow-hidden border border-white/10 bg-black/20">
@@ -826,7 +885,7 @@ export const Doacoes: React.FC<DoacoesProps> = ({ prefilledDoadorId, clearPrefil
                   {filteredDoacoesList.length === 0 ? (
                     <tr>
                       <td colSpan={6} className="p-8 text-center text-sm text-white/40">
-                        Nenhuma doação cadastrada encontrada.
+                        {isLoading ? 'Carregando...' : 'Nenhuma doação cadastrada encontrada.'}
                       </td>
                     </tr>
                   ) : (
@@ -895,6 +954,56 @@ export const Doacoes: React.FC<DoacoesProps> = ({ prefilledDoadorId, clearPrefil
                 </tbody>
               </table>
             </div>
+            {/* Pagination */}
+            {!isSearchActive && totalDoacoes > DOACOES_PAGE_SIZE && (
+              <div className="flex items-center justify-between px-4 py-3 border-t border-white/10 bg-white/5">
+                <span className="text-[10px] text-white/50 font-mono">
+                  Exibindo {(currentDoacoesPage - 1) * DOACOES_PAGE_SIZE + 1}-
+                  {Math.min(currentDoacoesPage * DOACOES_PAGE_SIZE, totalDoacoes)} de {totalDoacoes}
+                </span>
+                <div className="flex items-center gap-1">
+                  <button
+                    type="button"
+                    onClick={() => loadDoacoesPage(1)}
+                    disabled={currentDoacoesPage === 1}
+                    className="w-7 h-7 rounded flex items-center justify-center bg-white/10 hover:bg-white/20 disabled:opacity-30 disabled:hover:bg-white/10 text-white text-xs transition-all cursor-pointer"
+                    title="Primeira página"
+                  >
+                    <ChevronsLeft size={12} />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => loadDoacoesPage(currentDoacoesPage - 1)}
+                    disabled={currentDoacoesPage === 1}
+                    className="w-7 h-7 rounded flex items-center justify-center bg-white/10 hover:bg-white/20 disabled:opacity-30 disabled:hover:bg-white/10 text-white text-xs transition-all cursor-pointer"
+                    title="Página anterior"
+                  >
+                    <ChevronLeft size={12} />
+                  </button>
+                  <span className="px-3 py-1 text-[11px] font-mono text-blue-200 font-bold">
+                    {currentDoacoesPage} / {Math.ceil(totalDoacoes / DOACOES_PAGE_SIZE)}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => loadDoacoesPage(currentDoacoesPage + 1)}
+                    disabled={currentDoacoesPage >= Math.ceil(totalDoacoes / DOACOES_PAGE_SIZE)}
+                    className="w-7 h-7 rounded flex items-center justify-center bg-white/10 hover:bg-white/20 disabled:opacity-30 disabled:hover:bg-white/10 text-white text-xs transition-all cursor-pointer"
+                    title="Próxima página"
+                  >
+                    <ChevronRight size={12} />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => loadDoacoesPage(Math.ceil(totalDoacoes / DOACOES_PAGE_SIZE))}
+                    disabled={currentDoacoesPage >= Math.ceil(totalDoacoes / DOACOES_PAGE_SIZE)}
+                    className="w-7 h-7 rounded flex items-center justify-center bg-white/10 hover:bg-white/20 disabled:opacity-30 disabled:hover:bg-white/10 text-white text-xs transition-all cursor-pointer"
+                    title="Última página"
+                  >
+                    <ChevronsRight size={12} />
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         </div>
       </section>
